@@ -23,3 +23,5 @@
 
 # Mac filesystem dust
 /.DS_Store
+# maven-shade output
+/dependency-reduced-pom.xml

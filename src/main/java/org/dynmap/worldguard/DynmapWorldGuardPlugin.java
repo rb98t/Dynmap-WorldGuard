@@ -11,6 +11,7 @@ import java.util.UUID;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
+import io.papermc.paper.threadedregions.scheduler.ScheduledTask;
 import org.bstats.bukkit.Metrics;
 import org.bukkit.Bukkit;
 import org.bukkit.configuration.ConfigurationSection;
@@ -27,7 +28,6 @@ import org.dynmap.markers.AreaMarker;
 import org.dynmap.markers.MarkerAPI;
 import org.dynmap.markers.MarkerSet;
 
-import com.sk89q.squirrelid.cache.ProfileCache;
 import com.sk89q.worldedit.math.BlockVector2;
 import com.sk89q.worldedit.math.BlockVector3;
 import com.sk89q.worldedit.world.World;
@@ -42,6 +42,7 @@ import com.sk89q.worldguard.protection.regions.ProtectedPolygonalRegion;
 import com.sk89q.worldguard.protection.regions.ProtectedRegion;
 import com.sk89q.worldguard.protection.regions.RegionContainer;
 import com.sk89q.worldguard.protection.regions.RegionType;
+import com.sk89q.worldguard.util.profile.cache.ProfileCache;
 
 public class DynmapWorldGuardPlugin extends JavaPlugin {
     private static Logger log;
@@ -64,7 +65,9 @@ public class DynmapWorldGuardPlugin extends JavaPlugin {
     Map<String, AreaStyle> ownerstyle;
     Set<String> visible;
     Set<String> hidden;
-    boolean stop; 
+    volatile boolean stop;
+    /* Bumped on every activation, so a chain started by an earlier activation stops by itself */
+    volatile int generation;
     int maxdepth;
 
     @Override
@@ -247,10 +250,10 @@ public class DynmapWorldGuardPlugin extends JavaPlugin {
                 /* Make outline */
                 x = new double[4];
                 z = new double[4];
-                x[0] = l0.getX(); z[0] = l0.getZ();
-                x[1] = l0.getX(); z[1] = l1.getZ()+1.0;
-                x[2] = l1.getX() + 1.0; z[2] = l1.getZ()+1.0;
-                x[3] = l1.getX() + 1.0; z[3] = l0.getZ();
+                x[0] = l0.x(); z[0] = l0.z();
+                x[1] = l0.x(); z[1] = l1.z()+1.0;
+                x[2] = l1.x() + 1.0; z[2] = l1.z()+1.0;
+                x[3] = l1.x() + 1.0; z[3] = l0.z();
             }
             else if(tn == RegionType.POLYGON) {
                 ProtectedPolygonalRegion ppr = (ProtectedPolygonalRegion)region;
@@ -259,7 +262,7 @@ public class DynmapWorldGuardPlugin extends JavaPlugin {
                 z = new double[points.size()];
                 for(int i = 0; i < points.size(); i++) {
                     BlockVector2 pt = points.get(i);
-                    x[i] = pt.getX(); z[i] = pt.getZ();
+                    x[i] = pt.x(); z[i] = pt.z();
                 }
             }
             else {  /* Unsupported type */
@@ -277,7 +280,7 @@ public class DynmapWorldGuardPlugin extends JavaPlugin {
                 m.setLabel(name);   /* Update label */
             }
             if(use3d) { /* If 3D? */
-                m.setRangeY(l1.getY()+1.0, l0.getY());
+                m.setRangeY(l1.y()+1.0, l0.y());
             }            
             /* Set line and fill properties */
             addStyle(id, world.getName(), m, region);
@@ -292,14 +295,20 @@ public class DynmapWorldGuardPlugin extends JavaPlugin {
         }
     }
     
+    /* Folia has no main thread: the job runs on the global region thread (on Paper, the main thread) */
+    private void scheduleUpdate(Runnable job, long delayTicks) {
+        getServer().getGlobalRegionScheduler().runDelayed(this, (ScheduledTask t) -> job.run(), delayTicks);
+    }
+
     private class UpdateJob implements Runnable {
+        final int gen = generation;
         Map<String,AreaMarker> newmap = new HashMap<String,AreaMarker>(); /* Build new map */
         List<World> worldsToDo = null;
         List<ProtectedRegion> regionsToDo = null;
         World curworld = null;
         
         public void run() {
-            if (stop) {
+            if (stop || (gen != generation)) {
                 return;
             }
             // If worlds list isn't primed, prime it
@@ -319,7 +328,7 @@ public class DynmapWorldGuardPlugin extends JavaPlugin {
                     /* And replace with new map */
                     resareas = newmap;
                     // Set up for next update (new job)
-                    getServer().getScheduler().scheduleSyncDelayedTask(DynmapWorldGuardPlugin.this, new UpdateJob(), updperiod);
+                    scheduleUpdate(new UpdateJob(), updperiod);
                     return;
                 }
                 else {
@@ -352,7 +361,7 @@ public class DynmapWorldGuardPlugin extends JavaPlugin {
                 handleRegion(curworld, pr, newmap);
             }
             // Tick next step in the job
-            getServer().getScheduler().scheduleSyncDelayedTask(DynmapWorldGuardPlugin.this, this, 1);
+            scheduleUpdate(this, 1);
         }
     }
 
@@ -360,7 +369,7 @@ public class DynmapWorldGuardPlugin extends JavaPlugin {
         @EventHandler(priority=EventPriority.MONITOR)
         public void onPluginEnable(PluginEnableEvent event) {
             Plugin p = event.getPlugin();
-            String name = p.getDescription().getName();
+            String name = p.getPluginMeta().getName();
             if(name.equals("dynmap")) {
                 Plugin wg = p.getServer().getPluginManager().getPlugin("WorldGuard");
                 if(wg != null && wg.isEnabled())
@@ -491,10 +500,11 @@ public class DynmapWorldGuardPlugin extends JavaPlugin {
         if(per < 15) per = 15;
         updperiod = (long)(per*20);
         stop = false;
+        generation++;
+
+        scheduleUpdate(new UpdateJob(), 40);   /* First time is 2 seconds */
         
-        getServer().getScheduler().scheduleSyncDelayedTask(this, new UpdateJob(), 40);   /* First time is 2 seconds */
-        
-        info("version " + this.getDescription().getVersion() + " is activated");
+        info("version " + this.getPluginMeta().getVersion() + " is activated");
     }
 
     public void onDisable() {
@@ -502,8 +512,9 @@ public class DynmapWorldGuardPlugin extends JavaPlugin {
             set.deleteMarkerSet();
             set = null;
         }
-        resareas.clear();
         stop = true;
+        getServer().getGlobalRegionScheduler().cancelTasks(this);
+        resareas.clear();
     }
 
 }
